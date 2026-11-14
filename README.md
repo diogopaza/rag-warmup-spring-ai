@@ -10,7 +10,8 @@ na prática, com um projeto pequeno: embedding, chunk, vector store, busca por s
 prompt aumentado.
 
 **Stack:** Spring Boot 3.4 · Java 21 · Spring AI 1.0 · Ollama (LLM local, gratuito) ·
-`SimpleVectorStore` (em memória) → **Neon** (Postgres serverless com `pgvector`).
+`SimpleVectorStore` (em memória) → **Neon** (Postgres serverless com `pgvector`) ·
+**AWS simulada com LocalStack** (S3, SQS, Secrets Manager) · Docker Compose.
 
 ### O que é RAG, em 4 frases
 
@@ -44,7 +45,9 @@ Início: **14/11/2026** (sábado).
 | 5 | `QuestionAnswerAdvisor` (a abstração do Spring AI) | **25/11/2026** (qua) | | | ⏳ |
 | 6 | Neon: Postgres + `pgvector` na nuvem | **28/11/2026** (sáb) | | | ⏳ |
 | 7 | Neon console: SQL de similaridade, metadata e branching | **01/12/2026** (ter) | | | ⏳ |
-| 8 | Fechamento: filtros por metadata, README final | **03/12/2026** (qui) | | | ⏳ |
+| 8 | AWS com LocalStack: ingestão por eventos S3 → SQS + DLQ | **06/12/2026** (dom) | | | ⏳ |
+| 9 | Secrets Manager + Dockerfile + tudo no Docker Compose | **08/12/2026** (ter) | | | ⏳ |
+| 10 | Fechamento: filtros por metadata, README final | **10/12/2026** (qui) | | | ⏳ |
 
 Legenda: ⏳ pendente · 🔨 em andamento · ✅ entregue no prazo · ⚠️ entregue com atraso · ❌ não entregue
 
@@ -325,7 +328,116 @@ a busca que o Spring AI faz por você.
 
 ---
 
-## 🧩 ETAPA 8 — FECHAMENTO · prazo 03/12/2026
+## 🧩 ETAPA 8 — AWS COM LOCALSTACK: INGESTÃO ORIENTADA A EVENTOS (S3 → SQS) · prazo 06/12/2026
+
+### 🎯 Objetivo
+
+Até aqui a ingestão roda no `ApplicationRunner`, quando a aplicação sobe. Na AWS o padrão é outro:
+**o documento chega num bucket S3, o S3 publica um evento numa fila SQS, e a aplicação consome a fila
+e faz a ingestão.** Esse é o padrão *event-driven ingestion*: desacopla quem envia o documento de quem
+processa, aguenta picos (a fila segura os eventos) e permite reprocessar o que falhou.
+
+Tudo roda localmente no **LocalStack**, que simula a AWS dentro do Docker. Você não precisa de conta
+AWS nem gasta dinheiro.
+
+```
+ aws s3 cp politica.txt ──► [S3: rag-documentos] ──evento ObjectCreated──► [SQS: rag-ingestao]
+                                                                                  │
+                                                         @SqsListener (Spring) ◄──┘
+                                                                  │
+                                         baixa do S3 → chunks → embeddings → Neon (pgvector)
+                                                                  │ falhou 3x?
+                                                                  ▼
+                                                         [SQS: rag-ingestao-dlq]
+```
+
+### 🧪 Desafio
+
+* Criar um `docker-compose.yml` com o LocalStack (imagem `localstack/localstack`, porta `4566`,
+  `SERVICES=s3,sqs,secretsmanager`). Se a imagem pedir token, crie a conta gratuita no LocalStack e
+  passe `LOCALSTACK_AUTH_TOKEN` por variável de ambiente (fora do Git).
+* Criar um **script de inicialização** (`localstack/init/ready.d/01-setup.sh`, montado no container)
+  que, usando `awslocal`:
+  * cria o bucket `rag-documentos`
+  * cria a fila `rag-ingestao-dlq` e a fila `rag-ingestao` com **redrive policy** (`maxReceiveCount` = 3) apontando para a DLQ
+  * configura a **notificação do bucket** (`s3:ObjectCreated:*`) para publicar na fila `rag-ingestao`
+* Na aplicação, usar o **Spring Cloud AWS 3.x** (`spring-cloud-aws-starter-s3` e
+  `spring-cloud-aws-starter-sqs`, com o BOM `spring-cloud-aws-dependencies`), apontando para o LocalStack:
+  ```yaml
+  spring:
+    cloud:
+      aws:
+        endpoint: http://localhost:4566
+        region:
+          static: us-east-1
+        credentials:
+          access-key: test
+          secret-key: test
+        s3:
+          path-style-access-enabled: true
+  ```
+* Criar um `@SqsListener("rag-ingestao")` que lê o evento do S3 (`Records[].s3.bucket.name` e
+  `Records[].s3.object.key`), baixa o arquivo e faz a ingestão.
+* **Remover** a ingestão do `ApplicationRunner`: a partir de agora, documento novo entra só pelo S3.
+* Provar o fluxo: subir os 3 documentos com `awslocal s3 cp`, ver os logs da ingestão e perguntar no `/com-rag`.
+* Provar a DLQ: subir um arquivo que force erro (ex.: vazio ou binário), ver a mensagem ser tentada
+  3 vezes e cair na `rag-ingestao-dlq`.
+
+### ❓ Perguntas
+
+21. Por que esse fluxo usa uma fila entre o S3 e a aplicação, em vez de o S3 chamar a aplicação direto? O que acontece se a aplicação estiver fora do ar quando o arquivo chegar?
+22. Assim que você configura a notificação, o S3 manda uma mensagem `s3:TestEvent` para a fila. Seu listener tratou isso? O que aconteceria se não tratasse?
+23. SQS entrega a mensagem **pelo menos uma vez** (*at-least-once*). O mesmo arquivo pode ser ingerido duas vezes? Como sua solução da pergunta 16 ajuda aqui?
+24. O que é uma DLQ e para que serve o `maxReceiveCount`? O que um time faz com as mensagens que chegam na DLQ?
+25. As credenciais `test/test` e o `endpoint` do LocalStack não podem ir para produção. Como você separaria a configuração local da configuração da AWS de verdade (dica: profiles do Spring)? Na AWS de verdade, de onde a aplicação deveria tirar as credenciais (dica: IAM Role)?
+
+### 🎯 Avaliação (0 a 10)
+
+* LocalStack subindo com bucket, filas, DLQ e notificação criados automaticamente
+* Ingestão disparada pelo upload no S3, sem `ApplicationRunner`
+* DLQ funcionando e demonstrada
+* Configuração do LocalStack isolada num profile
+* Respostas às perguntas
+
+---
+
+## 🧩 ETAPA 9 — SECRETS MANAGER + TUDO NO DOCKER COMPOSE · prazo 08/12/2026
+
+### 🎯 Objetivo
+
+Dois padrões que aparecem em qualquer projeto na AWS: **segredos ficam no Secrets Manager**, não em
+variável de ambiente espalhada; e o ambiente inteiro sobe com **um comando**.
+
+### 🧪 Desafio
+
+* No script de inicialização do LocalStack, criar o segredo `/rag/neon` com `url`, `username` e
+  `password` do Neon. O script lê os valores de variáveis de ambiente, para eles não ficarem no Git.
+* Na aplicação, adicionar `spring-cloud-aws-starter-secrets-manager` e carregar o segredo com
+  `spring.config.import=aws-secretsmanager:/rag/neon`. Retirar `NEON_URL`, `NEON_USER` e `NEON_PASSWORD` do `application.yml`.
+* Criar um `Dockerfile` **multi-stage** para a aplicação (estágio de build com Maven e estágio final só com o JRE).
+* Colocar a aplicação no `docker-compose.yml` junto com o LocalStack, usando `depends_on` com
+  `healthcheck`, para a aplicação só subir quando o LocalStack estiver pronto.
+* Dentro do compose, a aplicação acessa o LocalStack por `http://localstack:4566` e não por `localhost`. Resolver isso por profile/variável, sem mudar código.
+* O Ollama continua rodando fora do Docker: descobrir como o container acessa o Ollama da sua máquina (`host.docker.internal`).
+* Critério de pronto: `docker compose up` sobe tudo, `awslocal s3 cp` ingere e `/com-rag` responde.
+
+### ❓ Perguntas
+
+26. Qual a vantagem do Secrets Manager sobre variável de ambiente? Pense em rotação de senha, auditoria e quem consegue ler o segredo.
+27. Por que, dentro do container, `localhost` não é o LocalStack? O que é a rede do Docker Compose?
+28. Por que o Dockerfile multi-stage gera uma imagem menor e mais segura que uma imagem com Maven + JDK?
+29. Quais diferenças entre LocalStack e AWS de verdade podem te enganar? (ex.: permissões IAM não são verificadas por padrão)
+
+### 🎯 Avaliação (0 a 10)
+
+* Segredo carregado do Secrets Manager, nenhuma credencial no repositório
+* Dockerfile multi-stage
+* `docker compose up` sobe o ambiente completo
+* Respostas às perguntas
+
+---
+
+## 🧩 ETAPA 10 — FECHAMENTO · prazo 10/12/2026
 
 ### 🎯 Objetivo
 
@@ -341,15 +453,15 @@ Fechar o projeto com um recurso que RAG de verdade usa muito, e deixar o README 
 
 ### ❓ Perguntas
 
-21. Num sistema multi-empresa (multi-tenant), como o filtro por metadata impede que a empresa A veja documentos da empresa B? Por que filtrar só no prompt não basta?
-22. Olhando para trás: em quais etapas você cumpriu o prazo e em quais não? O que causou cada atraso?
+30. Num sistema multi-empresa (multi-tenant), como o filtro por metadata impede que a empresa A veja documentos da empresa B? Por que filtrar só no prompt não basta?
+31. Olhando para trás: em quais etapas você cumpriu o prazo e em quais não? O que causou cada atraso?
 
 ### 🎯 Avaliação (0 a 10)
 
 * Filtro por metadata funcionando
 * Novo documento ingerido sem mudar código
 * README final
-* Honestidade na pergunta 22
+* Honestidade na pergunta 31
 
 ---
 
